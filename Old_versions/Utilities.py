@@ -2,7 +2,6 @@
 
 import math
 
-import numpy as np
 from scipy.stats import norm
 
 from Option import Option
@@ -123,6 +122,7 @@ mc_price takes an Option and a Process and knows nothing about
 GBM internals, antithetic construction, or closed-form formulas.
 All of that is encapsulated in Option and Process respectively.
 """
+import numpy as np
 
 def mc_price(option, process, Nsim, M=1, antithetic=True):
 
@@ -247,97 +247,3 @@ def mc_price_american_lsm(option, process, Nsim, M, antithetic=True):
     )
 
     return price, ci
-
-
-"""
-FFT (Carr-Madan) option pricer.
-
-fft_price prices European vanilla options directly from a process's
-characteristic function, with no simulation at all. It only requires
-
-    process.characteristic_function(u, T) = E^Q[exp(i * u * ln(S_T / S0))]
-
-so it plugs into any Process (GBM, MertonJumpDiffusion, KouJumpDiffusion,
-VarianceGamma, NIG, ...) that implements it, exactly like mc_price plugs
-into any Process that implements simulate().
-"""
-
-def fft_price(option, process, S0, r, T, alpha=1.5, N=2 ** 14, eta=0.05):
-    """
-    Price a European call or put using the Carr-Madan (1999) FFT method.
-
-    Parameters
-    ----------
-    option  : Option  - must be Option.eu_call(K) or Option.eu_put(K)
-                         (no barriers, no early exercise: this is a European
-                         vanilla method, not a general path-dependent one)
-    process : Process - any process implementing characteristic_function(u, T)
-    S0, r, T: float   - spot, risk-free rate, maturity (kept explicit, mirroring
-                         bls_price/crr_price, even though process already knows them)
-    alpha   : float   - Carr-Madan damping factor (> 0). Must satisfy the process's
-                         moment condition (E[S_T^{alpha+1}] < inf); 1.0-2.0 works for
-                         all processes implemented in process.py at typical parameters.
-    N       : int     - number of FFT grid points (power of 2)
-    eta     : float   - spacing of the integration grid in Fourier space
-
-    Returns
-    -------
-    float : option price
-
-    Notes
-    -----
-    - Put prices are obtained from the FFT call price via put-call parity
-      (C - P = S0 - K*e^{-rT}), which holds for European payoffs regardless
-      of the underlying dynamics, so only the call transform is needed.
-    - Barrier, American, and other exotic payoffs are NOT supported here —
-      their Fourier transforms are payoff-specific (e.g. Fourier-cosine /
-      COS method with reflection, or PIDE methods) and out of scope for this
-      simple Carr-Madan implementation.
-    """
-
-    if option.crr_condition_fn is not None or option.condition_fn is not None:
-        raise NotImplementedError("FFT pricing does not support barrier options.")
-    if option.exercise_fn is not None:
-        raise NotImplementedError("FFT pricing does not support American options.")
-    if option.payoff_fn not in (Option._call, Option._put):
-        raise NotImplementedError(
-            "FFT pricing currently supports only vanilla call/put payoffs "
-            "(Option.eu_call / Option.eu_put)."
-        )
-
-    K = option.K
-
-    def phi_lnS(u):
-        # characteristic function of ln(S_T) = ln(S0) + ln(S_T/S0)
-        return np.exp(1j * u * np.log(S0)) * process.characteristic_function(u, T)
-
-    # --- Carr-Madan grid ---
-    lam = 2 * np.pi / (N * eta)      # log-strike spacing
-    b = N * lam / 2.0                # half-width of log-strike grid
-    j = np.arange(N)
-    vj = j * eta                     # Fourier-space grid
-    ku = -b + lam * j                # log-strike grid, ku[j] = ln(K_j)
-
-    # damped call transform, evaluated on the Fourier grid
-    psi = (
-        np.exp(-r * T) * phi_lnS(vj - (alpha + 1) * 1j)
-        / (alpha ** 2 + alpha - vj ** 2 + 1j * (2 * alpha + 1) * vj)
-    )
-
-    # composite Simpson's rule weights
-    simpson_w = np.ones(N)
-    simpson_w[1:-1:2] = 4
-    simpson_w[2:-1:2] = 2
-    weights = simpson_w * eta / 3.0
-
-    x = np.exp(1j * b * vj) * psi * weights
-    y = np.fft.fft(x)
-
-    call_prices = (np.exp(-alpha * ku) / np.pi) * y.real
-
-    call_price = float(np.interp(np.log(K), ku, call_prices))
-
-    if option.payoff_fn is Option._call:
-        return call_price
-    else:  # Option._put — put-call parity, model-independent for European payoffs
-        return call_price - S0 + K * np.exp(-r * T)
